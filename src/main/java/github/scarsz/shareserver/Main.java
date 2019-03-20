@@ -30,7 +30,7 @@ public class Main {
             }
         }));
 
-        port(80);
+        port(8082);
 //        staticFiles.location("/static");
 
         // gzip where possible
