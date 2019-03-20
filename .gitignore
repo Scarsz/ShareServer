@@ -1,0 +1,12 @@
+/target/
+.settings
+.classpath
+.project
+/.idea/
+*.iml
+dependency-reduced-pom.xml
+.floo*
+/.gradle/
+*/*/build/
+build
+share.mv.db
