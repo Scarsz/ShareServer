@@ -1,24 +1,58 @@
 package github.scarsz.shareserver;
 
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.RandomStringUtils;
-import spark.utils.IOUtils;
-import spark.utils.StringUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.jline.reader.EndOfFileException;
+import org.jline.reader.LineReader;
+import org.jline.reader.LineReaderBuilder;
+import org.jline.reader.UserInterruptException;
 
 import javax.servlet.MultipartConfigElement;
 import java.io.File;
 import java.io.InputStream;
 import java.sql.*;
+import java.util.*;
+import java.util.stream.Collectors;
 
 import static spark.Spark.*;
 
 public class ShareServer {
 
-    private final Connection connection;
+    private final Thread shutdownHook;
+    private Connection connection;
+    private LineReader console;
 
-    public ShareServer(String key, int port) throws SQLException {
+    public ShareServer(String key, int port) throws Exception {
         if (key == null) throw new IllegalArgumentException("No key given");
 
-        connection = DriverManager.getConnection("jdbc:h2:" + new File("share").getAbsolutePath());
+        initDatabase();
+        initSpark(port, key);
+        Runtime.getRuntime().addShutdownHook(shutdownHook = new Thread(this::shutdown));
+        readConsole();
+    }
+
+    private void shutdown() {
+        log("Closing database connection");
+        try {
+            connection.close();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+
+        log("Goodbye");
+        System.exit(0);
+    }
+
+    private void initDatabase() throws SQLException {
+        if (connection != null) connection.close();
+
+        Map<String, Object> arguments = new HashMap<>();
+        arguments.put("TRACE_LEVEL_FILE", 0);
+        arguments.put("TRACE_LEVEL_SYSTEM_OUT", 1);
+        String argumentsString = ";" + arguments.entrySet().stream().map(entry -> entry.getKey() + "=" + entry.getValue()).collect(Collectors.joining(";"));
+        connection = DriverManager.getConnection("jdbc:h2:" + new File("share").getAbsolutePath() + argumentsString);
         connection.prepareStatement("CREATE TABLE IF NOT EXISTS `files` (" +
                 "`id` VARCHAR NOT NULL, " +
                 "`filename` VARCHAR NOT NULL, " +
@@ -26,14 +60,9 @@ public class ShareServer {
                 "`type` VARCHAR NOT NULL, " +
                 "`data` BLOB NOT NULL, " +
                 "PRIMARY KEY (`id`), UNIQUE KEY id (`id`))").executeUpdate();
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                connection.close();
-            } catch (SQLException e) {
-                e.printStackTrace();
-            }
-        }));
+    }
 
+    private void initSpark(int port, String key) {
         port(port);
 
         // gzip where possible
@@ -45,7 +74,7 @@ public class ShareServer {
             String ip = StringUtils.isNotBlank(forwardedFor) ? forwardedFor : request.ip();
             String method = request.requestMethod();
             String location = request.url() + (StringUtils.isNotBlank(request.queryString()) ? "?" + request.queryString() : "");
-            System.out.println(ip + ":" + request.raw().getRemotePort() + " " + method + " " + location + " -> " + response.status());
+            log(ip + ":" + request.raw().getRemotePort() + " " + method + " " + location + " -> " + response.status());
         });
 
         // redirect /id -> /id/filename.ext
@@ -93,7 +122,6 @@ public class ShareServer {
                 statement.setString(1, request.params(":id"));
                 ResultSet result = statement.executeQuery();
                 if (result.next()) {
-                    System.out.println(request.params(":id") + " is now at " + (result.getInt("hits") + 1) + " hits");
                     statement = connection.prepareStatement("UPDATE `files` SET `hits` = `hits` + 1 WHERE `id` = ?");
                     statement.setString(1, request.params(":id"));
                     statement.executeUpdate();
@@ -127,6 +155,119 @@ public class ShareServer {
                 return request.url() + id + "/" + fileName;
             }
         });
+    }
+
+    private void readConsole() {
+        console = LineReaderBuilder.builder()
+                .appName("ShareServer")
+                .build();
+        while (true) {
+            String line;
+            try {
+                line = console.readLine("share> ");
+            } catch (UserInterruptException e) {
+                shutdown();
+                return;
+            } catch (EndOfFileException e) {
+                return;
+            }
+
+            String[] split = line.split(" ", 2);
+            String command = split[0].toLowerCase();
+            String[] args = split.length > 1 ? ArrayUtils.subarray(split, 1, split.length) : new String[0];
+            String argsJoined = split.length == 2 ? split[1] : "";
+
+            try {
+                command:
+                switch (command) {
+                    case "exit":
+                    case "stop":
+                    case "quit":
+                    case "end":
+                        Runtime.getRuntime().removeShutdownHook(shutdownHook);
+                        shutdown();
+                        return;
+                    case "echo":
+                        log(String.join(" ", args));
+                        break;
+                    case "top": {
+                        int amount = args.length >= 1 ? Integer.parseInt(args[0]) : 25;
+                        ResultSet result = connection.createStatement().executeQuery("select id, filename, hits, type from files order by hits desc limit " + amount);
+                        if (result.isBeforeFirst()) {
+                            while (result.next()) {
+                                String id = result.getString("id");
+                                String filename = result.getString("filename");
+                                int hits = result.getInt("hits");
+                                log("File " + id + "/" + filename + " - " + hits + " hits");
+                            }
+                        } else {
+                            log("No files in database");
+                        }
+                        break;
+                    }
+                    case "sql":
+                    case "sqlf": {
+                        boolean full = command.equals("sqlf");
+                        Statement statement = connection.createStatement();
+                        if (statement.execute(argsJoined)) {
+                            ResultSet result = statement.getResultSet();
+                            ResultSetMetaData meta = result.getMetaData();
+                            int columns = meta.getColumnCount();
+                            int row;
+                            while (result.next()) {
+                                row = result.getRow();
+                                if (row > 100 && !full) {
+                                    log("<more results, limit or use sqlf to show all>");
+                                    break;
+                                }
+
+                                StringBuilder builder = new StringBuilder();
+                                for (int i = 1; i <= columns; i++) {
+                                    if (i > 1) builder.append(" | ");
+                                    String columnValue = result.getString(i);
+                                    builder.append(meta.getColumnName(i))
+                                            .append("=")
+                                            .append(columnValue);
+                                }
+                                log(builder);
+                            }
+                        }
+                        break;
+                    }
+                    case "rm":
+                    case "del":
+                    case "delete": {
+                        Set<String> targets = new HashSet<>();
+                        Collections.addAll(targets, args);
+                        while (targets.size() == 0) {
+                            try {
+                                Arrays.stream(console.readLine("file(s) to delete> ").split("[, ]"))
+                                        .filter(StringUtils::isAlphanumeric)
+                                        .forEach(targets::add);
+                            } catch (UserInterruptException | EndOfFileException e) {
+                                break command;
+                            }
+                        }
+                        for (String target : targets) {
+                            PreparedStatement s = connection.prepareStatement("delete from files where id like ?");
+                            s.setString(1, "%" + target + "%");
+                            int rows = s.executeUpdate();
+                            log("Deleting " + target + " -> " + rows + " affected rows");
+                        }
+                        break;
+                    }
+                    default:
+                        log("Unknown command");
+                        break;
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private void log(Object o) {
+        console.printAbove(o.toString());
     }
 
 }
