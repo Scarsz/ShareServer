@@ -10,3 +10,4 @@ dependency-reduced-pom.xml
 */*/build/
 build
 share.mv.db
+out/
