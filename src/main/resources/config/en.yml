@@ -1,0 +1,11 @@
+Server:
+  # Port the web server should listen on
+  Port: 8082
+  # Allowed keys for uploading
+  Keys:
+    - superdupersecret
+
+# Sometimes services will send POST requests instead of GET requests for download files.
+# This will redirect those POST requests to GET requests, allowing the download.
+# Otherwise, 404s will occur.
+Redirect POST to GET for downloads: true

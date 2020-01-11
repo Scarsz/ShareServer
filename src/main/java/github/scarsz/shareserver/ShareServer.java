@@ -1,5 +1,7 @@
 package github.scarsz.shareserver;
 
+import github.scarsz.configuralize.DynamicConfig;
+import github.scarsz.configuralize.ParseException;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.RandomStringUtils;
@@ -11,7 +13,9 @@ import org.jline.reader.UserInterruptException;
 
 import javax.servlet.MultipartConfigElement;
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.sql.*;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -21,14 +25,24 @@ import static spark.Spark.*;
 public class ShareServer {
 
     private final Thread shutdownHook;
+    private DynamicConfig config;
     private Connection connection;
     private LineReader console;
 
-    public ShareServer(String key, int port) throws Exception {
-        if (key == null) throw new IllegalArgumentException("No key given");
-
+    public ShareServer() throws Exception {
+        initConfig();
         initDatabase();
-        initSpark(port, key);
+        initSpark();
+        Runtime.getRuntime().addShutdownHook(shutdownHook = new Thread(this::shutdown));
+        readConsole();
+    }
+
+    public ShareServer(Set<String> keys, int port) throws Exception {
+        initConfig();
+        if (keys != null && keys.size() > 0) config.setRuntimeValue("Server.Keys", keys);
+        config.setRuntimeValue("Server.Port", port);
+        initDatabase();
+        initSpark();
         Runtime.getRuntime().addShutdownHook(shutdownHook = new Thread(this::shutdown));
         readConsole();
     }
@@ -43,6 +57,20 @@ public class ShareServer {
 
         log("Goodbye");
         System.exit(0);
+    }
+
+    private void initConfig() throws IOException, ParseException {
+        config = new DynamicConfig();
+        config.addSource(ShareServer.class, "config", new File("share.yml"));
+        config.saveAllDefaults();
+        config.loadAll();
+
+        List<String> keys = config.getStringList("Server.Keys");
+        if (keys.contains("superdupersecret")) {
+            keys.remove("superdupersecret");
+            config.setRuntimeValue("Server.Keys", keys);
+            log("Key \"superdupersecret\" is a default key, will not accept for authorization, change it in share.yml");
+        }
     }
 
     private void initDatabase() throws SQLException {
@@ -62,8 +90,8 @@ public class ShareServer {
                 "PRIMARY KEY (`id`), UNIQUE KEY id (`id`))").executeUpdate();
     }
 
-    private void initSpark(int port, String key) {
-        port(port);
+    private void initSpark() {
+        port(config.getInt("Server.Port"));
 
         // gzip where possible
         after((request, response) -> response.header("Content-Encoding", "gzip"));
@@ -115,17 +143,21 @@ public class ShareServer {
             }
         });
 
+        if (config.getBoolean("Redirect POST to GET for downloads")) {
+            post("/:id", (request, response) -> {
+                response.redirect("/" + request.params(":id"), 303);
+                return null;
+            });
+            post("/:id/*", (request, response) -> {
+                response.redirect("/" + request.params(":id") + (request.splat().length > 0 ? ("/" + request.splat()[0]) : ""), 303);
+                return null;
+            });
+        }
+
         // hit counting
         after("/:id/*", (request, response) -> {
             if (response.status() == 200) {
-                PreparedStatement statement = connection.prepareStatement("SELECT `hits` FROM `files` WHERE `id` = ?");
-                statement.setString(1, request.params(":id"));
-                ResultSet result = statement.executeQuery();
-                if (result.next()) {
-                    statement = connection.prepareStatement("UPDATE `files` SET `hits` = `hits` + 1 WHERE `id` = ?");
-                    statement.setString(1, request.params(":id"));
-                    statement.executeUpdate();
-                }
+                incrementHits(request.params(":id"));
             }
         });
 
@@ -134,9 +166,9 @@ public class ShareServer {
             request.attribute("org.eclipse.jetty.multipartConfig", new MultipartConfigElement("/temp"));
 
             String givenKey = request.raw().getPart("key") != null
-                    ? IOUtils.toString(request.raw().getPart("key").getInputStream())
+                    ? IOUtils.toString(request.raw().getPart("key").getInputStream(), StandardCharsets.UTF_8)
                     : null;
-            if (StringUtils.isBlank(givenKey) || !givenKey.equals(key)) {
+            if (StringUtils.isBlank(givenKey) || !config.getStringList("Server.Keys").contains(givenKey)) {
                 halt(403, "Forbidden");
             }
 
@@ -158,9 +190,7 @@ public class ShareServer {
     }
 
     private void readConsole() {
-        console = LineReaderBuilder.builder()
-                .appName("ShareServer")
-                .build();
+        console = LineReaderBuilder.builder().appName("ShareServer").build();
         while (true) {
             String line;
             try {
@@ -268,6 +298,12 @@ public class ShareServer {
 
     private void log(Object o) {
         console.printAbove(o.toString());
+    }
+
+    private void incrementHits(String id) throws SQLException {
+        PreparedStatement statement = connection.prepareStatement("UPDATE `files` SET `hits` = `hits` + 1 WHERE `id` = ?");
+        statement.setString(1, id);
+        statement.executeUpdate();
     }
 
 }
